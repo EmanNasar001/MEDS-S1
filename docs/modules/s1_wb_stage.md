@@ -6,19 +6,29 @@
 | **Owner** | @EmanNasar001 |
 | **Backup** | _(assign at the T-02 design review)_ |
 | **Project** | T-02 (core backend), against the completion buffer R-01 will build |
-| **Spec** | SPEC §6, §7.5, §8.1, §9.1, §9.2, §28.2; INTERFACES.md §1.4a |
+| **Spec** | SPEC §6, §7.5, §8.1, §8.2, §9.1, §9.2, §28.2; INTERFACES.md §1.4a |
 | **Source** | `rtl/core/s1_wb_stage.sv` |
-| **Testbench** | `verif/unit/tb_s1_wb_stage.sv` (models in `verif/common/s1_wb_stage_model.svh`): 3 600 488 checks |
+| **Testbench** | `verif/unit/tb_s1_wb_stage.sv` (models in `verif/common/s1_wb_stage_model.svh`): 2 759 591 checks |
 
 ## Purpose
 
-Stage five. It takes the MEM/WB completion `s1_mem_stage` produces (#18) and turns it into two
-things: the write that resolves the instruction's completion-buffer entry, and the answer ID gets
-when it asks for that instruction's destination register in the same cycle.
+Stage five. Every result the core produces reaches the completion buffer through here. WB picks one
+per cycle, writes the entry it names, and answers ID's operand reads for that value in the same
+cycle.
 
-It is small on purpose. Almost everything SPEC §7.5 appears to put here happens somewhere else, and
-which things those are is the part of this module worth reviewing — see *Where §7.5's four bullets
-actually land* below.
+It is the junction between four things other projects own, and its job is to be the place they meet:
+
+| Counterparty | Owner | What crosses |
+|---|---|---|
+| `s1_mem_stage` | R-02, #18 | `mem_wb_t` in — the main pipe's completion |
+| MUL / DIV | T-02 | `md_rsp_t` in on `N_UC` channels, `uc_ready_o` back — the return leg of #15's `md_req_t` |
+| `s1_completion_buffer` | **R-01** | `cb_we_o` / `cb_idx_o` / `cb_upd_o` out — everything retire needs to commit the instruction |
+| `s1_hazard` | T-02 | `fwd_hit_o` / `fwd_data_o` out — SPEC §8.1's MEM/WB source |
+
+**This module does not build any of those.** It carries signals to and from them. Retire itself —
+the retire pointer, the architectural register and CSR writes, the store-buffer commit, the trap and
+the RVFI channel — is R-01's, at the retire pointer, not here. What WB owes retire is a complete,
+already-gated record of what the instruction did, and that is what `wb_upd_t` is.
 
 ## Interface contract
 
@@ -26,54 +36,84 @@ actually land* below.
 
 | Signal | Dir | Width | Meaning | Contract |
 |---|---|---|---|---|
-| `flush_i` | in | 1 | retire flush | discards the completion presented in the same cycle, and the bypass with it |
-| `wb_valid_i` | in | 1 | a completion is presented | **no `ready`**: the entry was allocated in ID, so WB cannot refuse and never stalls MEM |
-| `wb_i` | in | `mem_wb_t` | MEM/WB register (#18) | sampled only when `wb_valid_i`; every field is used (see below) |
-| `cb_we_o` | out | 1 | write the entry `cb_idx_o` names | 1 only for a completion the main pipe owns and that a flush did not remove |
-| `cb_idx_o` | out | `CB_IDX_W` | which entry | `wb_i.cb_idx`; meaningful only with `cb_we_o` |
-| `cb_upd_o` | out | `wb_upd_t` | what to write into it | meaningful only with `cb_we_o`; a pure function of `wb_i`, so the buffer stores it and re-derives nothing |
+| `clk_i`, `rst_ni` | in | 1 | clock, reset | async assert, sync de-assert; the only state is the grant rotation |
+| `flush_i` | in | 1 | retire flush | discards the completion presented in the same cycle, drains every unit, suppresses the bypass |
+| `wb_valid_i` | in | 1 | the main pipe presents a completion | **no `ready`**: the entry was allocated in ID, so WB cannot refuse and never stalls MEM |
+| `wb_i` | in | `mem_wb_t` | MEM/WB register (#18) | sampled only when `wb_valid_i` |
+| `uc_valid_i` | in | `N_UC` × 1 | a unit presents a result | `valid` must not depend on `uc_ready_o` (R-C10); hold the payload until accepted |
+| `uc_ready_o` | out | `N_UC` × 1 | that result is taken this cycle | may depend on `uc_valid_i`; 1 for **every** channel during a flush |
+| `uc_i` | in | `N_UC` × `md_rsp_t` | entry, register, value | no exception group: RV64M does not trap |
+| `cb_we_o` | out | 1 | write the entry `cb_idx_o` names | at most one per cycle, from one source |
+| `cb_idx_o` | out | `CB_IDX_W` | which entry | meaningful only with `cb_we_o` |
+| `cb_upd_o` | out | `wb_upd_t` | what to write | meaningful only with `cb_we_o` |
 | `fwd_raddr_i` | in | `N_READ` × `REG_ADDR_W` | ID's operand register numbers | read-only: **no output but `fwd_hit_o` depends on these** |
-| `fwd_hit_o` | out | `N_READ` × 1 | this port's operand is the value below | 0 for x0, for a trapping instruction, and during a flush |
+| `fwd_hit_o` | out | `N_READ` × 1 | this operand is the value below | 0 for x0, for a trapping instruction, and during a flush |
 | `fwd_data_o` | out | `XLEN` | the value | one bus for all ports — there is only ever one completion |
+| `uc_stall_o` | out | 1 | a unit result was held off | perf event; 0 during a flush, which drains rather than stalls |
 
-**Handshake:** none in either direction. MEM cannot be refused and the completion buffer cannot
-refuse WB; `cb_we_o` is a write strobe, not a request.
-**Latency:** zero. The module is combinational, and *that is the contract*: the entry is written at
-the end of the cycle the completion arrives, so the bypass and the write are the same event.
-**Backpressure:** none exists. This is checked, not assumed — the testbench asserts on every case
-that a completion the main pipe owns is either written or flushed in the cycle it is offered.
-**Reset state:** no reset. With `wb_valid_i` low the outputs are `cb_we_o = 0` and every
-`fwd_hit_o` 0, whatever is on `wb_i`.
+**Handshake:** the main-pipe channel has no `ready` in either direction. The unit channels are
+AXI-style and WB is the only consumer.
+**Latency:** zero. The entry is written at the end of the cycle the completion arrives, so the
+bypass and the write are the same event.
+**Backpressure:** never towards MEM. Towards a unit, for as long as the main pipe keeps the port.
+**Reset state:** `cb_we_o = 0`, every `fwd_hit_o` 0, `uc_stall_o = 0`, grant pointing at channel 0.
 
 ### `wb_upd_t` (new in `s1_pkg`)
 
 | Field | Contents |
 |---|---|
-| `done`, `norollback` | both 1. `cb_we_o` is asserted only for an instruction the main pipe has resolved, and a resolved main-pipe instruction cannot fault again (SPEC §9.1) |
+| `done`, `norollback` | both 1. `cb_we_o` is asserted only for a completion its producer has resolved, and neither the main pipe nor a MUL/DIV result can fault afterwards (SPEC §9.1) |
+| `from_main` | 1 = the main pipe produced this, so the group below is live. 0 = a multi-cycle unit, and the entry keeps what allocation put there |
 | `rd`, `rd_we`, `result` | the architectural register write, **already gated**: 0 / 0 / 0 unless the instruction really updates a register |
 | `next_pc` | RVFI `pc_wdata`, from EX |
 | `exc`, `exccode`, `exctval` | passed through from MEM |
-| `csr` | `{we, addr, wdata}`; `we` is suppressed by an exception, `addr` and `wdata` pass through |
+| `csr` | `{we, addr, wdata}`; `we` is suppressed by an exception |
 | `sb_alloc` | passed through unchanged — deliberately, see *Behaviour* |
-| `rvfi` | `{addr, rmask, wmask, rdata, wdata}` repacked from MEM's `mem_*` group and carried unchanged; the masks are MEM's and WB does not re-derive them |
+| `rvfi` | `{addr, rmask, wmask, rdata, wdata}` repacked from MEM's `mem_*` group and carried unchanged |
+
+`from_main` exists because a multi-cycle unit knows an entry, a register and a value, and nothing
+else. It has never seen a branch target, a CSR write, a store-buffer slot or a memory access. The
+alternative — making the units drive those fields with zeros — would have the completion buffer
+unable to tell "no branch target" from "branch target zero", and would quietly erase the instruction
+information allocation had already put in the entry.
 
 ## Parameters
 
 | Parameter | Default | Legal range | Effect |
 |---|---|---|---|
-| `N_READ` | 2 | ≥ 1 (elaboration error below) | ID operand read ports the bypass answers. 2 is `rs1`/`rs2`; a third would be for an FMA-style third operand |
+| `N_READ` | 2 | ≥ 1 (elaboration error below) | ID operand read ports the bypass answers |
+| `N_UC` | 2 | ≥ 1 (elaboration error below) | multi-cycle completion channels. MUL and DIV. With no M extension, tie `uc_valid_i[0]` low rather than setting this to 0 |
 
 ## Behaviour
 
 ```
-  wb_valid_i ──┬─► resolved? ──► cb_we_o ──► completion buffer entry cb_idx_o
-   flush_i ────┘     │
-                     └─► writes a register? ──┬─► cb_upd_o.rd / rd_we / result
-     wb_i ───────────────────────────────────┐└─► fwd_hit_o[k] = (fwd_raddr_i[k] == rd)
-                                             └──► everything else, passed through
+  wb_valid_i ──► resolved? ─────────────┬──► cb_we_o ──► entry cb_idx_o
+                                        │
+  uc_valid_i[0] ──┐                     │
+  uc_valid_i[1] ──┤ rotate ──► uc_gnt ──┘
+       ...        │                     └──► writes a register? ──► fwd_hit_o[k]
+                  └──► uc_ready_o[k]
 ```
 
-Three questions decide everything the module does.
+### Who gets the port
+
+**The main pipe always wins.** Its channel has no `ready`, because the completion buffer entry was
+allocated in ID and MEM cannot be told to wait; a unit holds its result until WB takes it. That
+asymmetry is not a preference, it is the only arrangement the two contracts allow.
+
+**Between units the grant rotates.** Fixed priority would be smaller, but MUL completes far more
+often than DIV and would starve it for as long as a multiply-heavy loop runs. The rotation costs one
+pointer and turns "no channel waits for ever" into something the testbench checks rather than a
+claim about workloads.
+
+**A flush drains every unit at once.** `uc_ready_o` is 1 on every channel in a flush cycle and
+nothing is written. A unit holding a result for an entry the flush removed would otherwise wait for
+a ready that will never mean anything, and would never free itself — a stall that outlives the
+instruction that caused it.
+
+### What gets written
+
+Three questions decide the rest.
 
 **1. Is this entry the main pipe's to write?** An MXIF candidate travels the main pipe as a
 placeholder. It carries `complete = 0`, and from the moment it is offloaded its entry belongs to the
@@ -88,7 +128,8 @@ WB does.
 
 **2. Does it update an architectural register?** Three independent reasons it may not: it has no
 destination, it trapped (SPEC §9.2 step 6 skips steps 1–3), or the destination is x0. All three
-produce `rd = 0`, `rd_we = 0`, `result = 0` and no bypass hit.
+produce `rd = 0`, `rd_we = 0`, `result = 0` and no bypass hit. A unit result has only the last two —
+RV64M raises no exceptions, so there is no trap to suppress.
 
 x0 is dropped *here* rather than at retire because the bypass is fed from the same signal. Retire
 writing x0 is harmless — the register file discards it — but a bypass that answers with it turns
@@ -107,10 +148,12 @@ here would look defensive and would be a leak: the entry is allocated in MEM, ne
 retire, never drained, and the buffer is one slot smaller for the rest of time. If the two are ever
 seen together, the bug is upstream and should be found there.
 
-**The bypass covers exactly one cycle.** The entry is written at the end of this cycle, so from the
-next one the completion buffer's own bypass — SPEC §8.1's fourth source — answers for it. Until
-then nothing else can, because the value exists only on this port. Without it, every consumer of a
-load or a multi-cycle result would stall a cycle for a value already in hand.
+### The bypass covers exactly one cycle
+
+The entry is written at the end of this cycle, so from the next one the completion buffer's own
+bypass — SPEC §8.1's fourth source — answers for it. Until then nothing else can, because the value
+exists only on this port. Without it, every consumer of a load or a multi-cycle result would stall a
+cycle for a value already in hand.
 
 ### Where §7.5's four bullets actually land
 
@@ -138,65 +181,77 @@ that would have accompanied the instruction are suppressed. The store-buffer fla
 | Layer | Status | Where |
 |---|---|---|
 | Lint | clean, no waivers | `make lint` |
-| Unit test | **3 600 488 checks**; runs three instances at `N_READ` 1, 2 and 3 | `verif/unit/tb_s1_wb_stage.sv` |
-| Mutation | 20 hand-inserted bugs, 20 caught | table below |
+| Unit test | **2 759 591 checks**; runs three instances at `N_READ` 1, 2 and 3 | `verif/unit/tb_s1_wb_stage.sv` |
+| Mutation | 31 hand-inserted bugs, 31 caught | table below |
 | Integration, co-simulation, arch tests | not yet | needs #18, R-01's completion buffer and the rest of the core |
 
-The testbench plays MEM (drives MEM/WB), the completion buffer (checks the write port), retire
-(drives `flush_i`) and ID (drives the operand read addresses and checks the bypass). The reference
+The testbench plays MEM, the multi-cycle units, the completion buffer, retire and ID. The reference
 model is written independently of the RTL: a test case is an abstract statement of what the
-instruction did, and it is rendered twice — once into the `mem_wb_t` MEM would have built, once into
-the completion-buffer write SPEC §9.1 and §9.2 require. The two renderings share no code.
+instruction did, rendered twice with no shared code — once into the `mem_wb_t` MEM would have built,
+once into the completion-buffer write SPEC §9.1 and §9.2 require. The arbiter model keeps its own
+rotation pointer, advanced by the rule the module documents rather than copied from the DUT, because
+a pointer read out of the RTL would agree with a broken arbiter too.
 
 - **Exhaustive over the control space.** All 256 combinations of `wb_valid_i`, `flush_i`,
-  `complete`, `exc`, `rd_we`, `rd == x0`, `csr_we` and `sb_alloc`, 96 times each with independent
-  random payloads, every output checked on all three instances. Every other test is a named corner
-  of that space.
+  `complete`, `exc`, `rd_we`, `rd == x0`, `csr_we` and `sb_alloc`, 48 times each with independent
+  random payloads and random unit traffic alongside.
 - **Exhaustive over the bypass.** Every destination register against every read address, 32 × 32,
   on every read port.
-- **Directed.** One completion of each class — ALU, load, store, branch, JAL, CSR, MXIF candidate,
-  and an instruction that writes nothing — with the fields that matter to that class checked by
-  name. x0 written and not forwarded; a trap suppressing the register and CSR writes while still
-  resolving the entry; an MXIF candidate's entry left untouched, and the same candidate resolved
-  once it has faulted; flush discarding a completion and the next one going through; a
-  store-buffer entry surviving an exception on the same completion; every completion-buffer index
-  addressable.
-- **Every case.** A completion the main pipe owns is written or flushed in the cycle it is offered
-  — the property that stands in for a liveness check in a module with no handshake. `wb_i` is
-  ignored entirely while `wb_valid_i` is low. The completion-buffer write is independent of the
-  operand read addresses, checked by re-applying the same case with different ones. All three
-  `N_READ` instances agree on every shared output.
-- **Random soak.** 120 000 cases: random instruction class, 12% of them trapping, 15% of the
-  writers targeting x0, 15% no completion at all, 10% flushed, operand reads biased one in three
-  towards the destination. The last run: register writes 45 946, no register write 48 757, x0
-  13 062, traps 15 156 (8 005 of them suppressing a register write, 2 600 a CSR write), MXIF
-  candidates 6 752 (2 620 of them faulted), flushed 16 931, idle 32 228, store-buffer allocations
-  15 433, bypass one port 20 638 / both ports 6 496 / neither 18 812.
+- **Directed, main pipe.** One completion of each class with the fields that matter checked by name;
+  x0; traps; MXIF candidates both untouched and faulted; flush; a store-buffer entry surviving an
+  exception; every completion-buffer index addressable.
+- **Directed, units.** A unit result writes `done`, `norollback`, `rd` and `result` and **nothing
+  else** — `from_main` clear and the whole pass-through group zero. The main pipe wins contention
+  and both units hold. The grant rotates: over eight contended cycles exactly one unit is accepted
+  each cycle and the two alternate. A flush drains both units, writes nothing, and is not counted as
+  a stall.
+- **Every case.** A main-pipe completion is written or flushed in the cycle it is offered — the
+  property that stands in for a liveness check on a channel with no handshake. `uc_ready_o` is
+  checked against the modelled grant on every channel every cycle. `wb_i` is ignored entirely while
+  `wb_valid_i` is low. The completion-buffer write is independent of the operand read addresses,
+  checked by re-applying the same case with different ones. All three `N_READ` instances agree on
+  every shared output.
+- **Random soak.** 60 000 cases with the main pipe and both units contending, 10% flushed. The last
+  run: register writes 30 942, x0 5 689, traps 6 684, MXIF candidates 3 163 (1 329 faulted),
+  store-buffer allocations 6 643, bypass one port 9 106 / both 2 936 / neither 18 900, unit grants
+  15 225 split 7 552 / 7 673 between the two channels with 9 732 alternations, unit results blocked
+  30 545, both units contending 14 006, units drained by a flush 8 263.
 
 Mutants, each a lint-clean copy of `s1_wb_stage.sv` with one change:
 
 | Mutant | Bug injected | Caught by |
 |---|---|---|
-| x0 forwarded | `rd != 0` dropped from the write condition | `upd.rd_we` |
+| x0 forwarded | `rd != 0` dropped from the main-pipe write condition | `upd.rd_we` |
 | trap writes rd | `~exc` dropped from the write condition | `upd.rd` |
 | CSR survives trap | `~exc` dropped from `csr.we` | `upd.csr.we` |
 | CSR write gated on rd_we | `csr.we` also requires a register write | `upd.csr.we` |
 | flush gates only the bypass | flush suppresses forwarding but not the entry write | `cb_we` |
 | bypass ignores flush | forwarding survives the flush that dropped the entry | `fwd_hit[0]` |
-| bypass ignores rd_we | forwarding for an instruction that writes no register | `fwd_hit[1]` |
-| resolved uses xor not or | `complete ^ exc` instead of `|` — a trapping instruction is dropped | `cb_we` |
-| faulted candidate dropped | an MXIF candidate that trapped is left unresolved for ever | `cb_we` |
+| bypass ignores rd_we | forwarding for a completion that writes no register | `fwd_hit[0]` |
+| resolved uses xor not or | `complete ^ exc` — a trapping instruction is dropped | `cb_idx` |
+| faulted candidate dropped | an MXIF candidate that trapped is never resolved | `cb_idx` |
 | sb_alloc gated on exc | the defensive gate that strands a store-buffer entry | `upd.sb_alloc` |
 | rd leaks when not writing | `rd` passed through when the instruction writes nothing | `upd.rd` |
 | result leaks when not writing | `result` passed through likewise | `upd.result` |
-| done from complete | `done` taken from `complete`, so a faulted candidate is never done | `upd.done` |
-| norollback cleared | main-pipe instruction marked rollback-able (SPEC §9.1) | `upd.norollback` |
+| norollback cleared | main-pipe completion marked rollback-able (SPEC §9.1) | `upd.norollback` |
 | RVFI masks swapped | `rmask` and `wmask` exchanged | `upd.rvfi.rmask` |
 | RVFI data swapped | `rdata` and `wdata` exchanged | `upd.rvfi.rdata` |
 | mtval and pc_wdata swapped | `exctval` and `next_pc` exchanged | `upd.next_pc` |
-| wrong entry addressed | `cb_idx` off by one | `cb_idx` |
-| entry addressed by rd | `cb_idx` xored with the destination | `cb_idx` |
+| wrong entry addressed | main-pipe `cb_idx` off by one | `cb_idx` |
 | every port answers port 0 | every `fwd_hit_o` compares `fwd_raddr_i[0]` | `fwd_hit[1]` |
+| unit result writes x0 | the x0 gate dropped on the unit path only | `upd.rd_we` |
+| unit entry misaddressed | a unit's `cb_idx` xored with 1 | `cb_idx` |
+| a unit outranks the main pipe | the port is offered to a unit while MEM is presenting | `uc_ready[1]` |
+| unit accepted while the main pipe holds the port | `uc_ready_o` ignores who has the port | `uc_ready[1]` |
+| flush does not drain the units | a unit is left holding a result for a flushed entry | `uc_ready[0]` |
+| grant does not rotate | the rotation pointer never advances: fixed priority | `cb_idx` |
+| rotation stops on the granted channel | pointer set to the winner instead of past it | `upd.rd` |
+| two units granted at once | the first-match guard dropped from the arbiter | `upd.rd` |
+| unit result claims the main pipe's fields | `from_main` tied 1 | `upd.from_main` |
+| unit result carries MEM's pass-through group | the `from_main` guard dropped around the group | `upd.next_pc` |
+| unit bypass uses the main pipe's rd | `sel_rd` never switches to the unit | `upd.rd` |
+| unit result value from the main pipe | `sel_result` sources inverted | `upd.result` |
+| stall reported during a flush | `uc_stall_o` not suppressed by `flush_i` | `uc_stall` |
 
 **A testbench bug worth repeating.** The first version drew each operand read address as
 `(($urandom % 100) < 35) ? rd : REG_ADDR_W'($urandom)`. Verilator 5.036 hoists a `$urandom` call
@@ -210,23 +265,27 @@ the distribution behind them should be re-measured before that number is quoted 
 
 ## Known limitations
 
-- **One completion per cycle, from the main pipe only.** MUL, DIV and the MXIF port also complete
-  into the buffer (SPEC §6, §8.2) and nothing here arbitrates for them. Whoever builds R-01 must
-  decide between a second write port and an arbiter in front of this one; if it is an arbiter, this
-  module's completion must win unconditionally, because `wb_valid_i` has no `ready` and MEM cannot
-  be told to wait.
+- **One completion per cycle.** With the main pipe and two units all presenting, two results wait.
+  That is the right trade at this width — a second completion-buffer write port costs an entire
+  extra write path through an 8-entry × ~200-bit array to serve a case that needs MUL and DIV and a
+  load all finishing together — but it is a parameter of the design, not a law. If `uc_stall_o`
+  shows up in a profile, a second port is the answer.
 - **`cb_upd_o` is a subset of `cb_entry_t`, not the entry.** `valid`, `pc`, `instr`, `is_mxif`,
   `mxif_id` and `unit` are ID's and are not touched here. `wb_upd_t` exists because R-01 owns
   `cb_entry_t` and this module should not pre-empt its shape.
-- **Combinational, and on MEM's critical path.** `s1_mem_stage` already lists
-  `I2 rdata → merge → extend → wb_o` as a critical path; this module adds the x0/exception gate and
-  the bypass comparators on top of it. If it does not meet timing, the fix is not to register this
-  module — that would cost a forwarding bubble on every load — but to register MEM's extend stage
-  and accept the extra cycle there.
-- **The bypass does not know about age.** It answers for one completion, so there is nothing to
-  arbitrate. The moment a second completion source exists, the operand mux must prefer the younger
-  one and that comparison has to live somewhere.
-- Tested at `XLEN = 64`, `CB_DEPTH = 8`, `N_READ` 1, 2 and 3.
+- **Combinational into the completion buffer, and on MEM's critical path.** `s1_mem_stage` already
+  lists `I2 rdata → merge → extend → wb_o` as a critical path; this module adds the source mux, the
+  x0/exception gate and the bypass comparators on top of it. If it does not meet timing, the fix is
+  not to register this module — that would cost a forwarding bubble on every load — but to register
+  MEM's extend stage and accept the extra cycle there.
+- **The bypass does not know about age**, because it answers for one completion and there is nothing
+  to arbitrate. SPEC §8.1's other three sources are ordered by whoever combines them, which is
+  `s1_hazard`'s job, not this module's.
+- **Nothing here checks that a unit's `cb_idx` names a live entry.** A unit that answers for an
+  entry that was flushed writes a stale value into whatever now occupies that index. The completion
+  buffer can catch it — it knows which entries are allocated — and the flush drain makes it unlikely,
+  but the check belongs at the far end and R-01 should add it.
+- Tested at `XLEN = 64`, `CB_DEPTH = 8`, `N_READ` 1, 2 and 3, `N_UC` 2.
 
 ## Open questions
 
@@ -235,11 +294,13 @@ the distribution behind them should be re-measured before that number is quoted 
    retire pointer" and §9.2 step 1. This module implements the §6/§9.2 reading. If that is right,
    §7.5 should say "result writeback into the completion buffer entry" — a one-line spec fix, and
    worth making before three more people read it the other way.
-2. **Does retire need to distinguish "no register write" from "wrote x0"?** WB erases the
+2. **Does `md_rsp_t` belong to this module or to #15?** #15 defines `md_req_t`, the dispatch leg.
+   The response leg is defined here because nothing in #15 consumes it, but the pair should live
+   together — most naturally in #15, with this module rebasing onto it as it already does for
+   `mem_wb_t`.
+3. **Does retire need to distinguish "no register write" from "wrote x0"?** WB erases the
    difference, which is what RVFI wants. If the debug module ever wants to show the instruction's
    nominal destination, the entry needs the ungated `rd` as well.
-3. **Who marks an MXIF candidate's entry when the coprocessor rejects it?** §9.2 says the rejection
+4. **Who marks an MXIF candidate's entry when the coprocessor rejects it?** §9.2 says the rejection
    becomes an illegal-instruction trap, but the entry is at the head by then and has already passed
    WB. R-01's offload path has to write it, not this module — confirm when the MXIF port lands.
-4. **`wb_upd_t` should be folded into whatever R-01 names.** It is deliberately not a `cb_entry_t`
-   and should not become one by accident.

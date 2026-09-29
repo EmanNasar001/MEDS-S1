@@ -137,6 +137,7 @@
 
     e.upd.done       = 1'b1;             // resolved, by definition of `owns`
     e.upd.norollback = 1'b1;             // SPEC 9.1: always 1 for the main pipe
+    e.upd.from_main  = 1'b1;
 
     e.upd.rd         = writes ? n.rd     : '0;
     e.upd.rd_we      = writes;
@@ -267,4 +268,59 @@
     // not answer, so the stimulus forces it far more often than a compiler would.
     if (n.rd_we && ($urandom % 100) < 15) n.rd = '0;
     return n;
+  endfunction
+
+  // ---------------------------------------------------------------------------
+  // Multi-cycle channels
+  //
+  // The model keeps its own rotation pointer and advances it by the rule the
+  // module documents -- past whichever channel was granted -- rather than by
+  // watching the DUT's.  A pointer copied from the RTL would agree with any
+  // arbiter, including a broken one.
+  // ---------------------------------------------------------------------------
+  int m_rr = 0;
+
+  function automatic int golden_grant(bit uc_v [N_UC_TB], bit port_free);
+    if (!port_free) return -1;
+    for (int i = 0; i < N_UC_TB; i++) begin
+      int k;
+      k = (m_rr + i) % N_UC_TB;
+      if (uc_v[k]) return k;
+    end
+    return -1;
+  endfunction
+
+  // A multi-cycle result: an entry index, a register and a value.  It carries
+  // nothing about the instruction, which is the whole point of `from_main`.
+  function automatic md_rsp_t make_uc();
+    md_rsp_t r;
+    int      z;
+    r        = '0;
+    r.cb_idx = CB_IDX_W'($urandom);
+    r.rd_we  = 1'($urandom % 100 < 90);
+    z        = $urandom % 100;
+    r.rd     = (z < 15) ? REG_ADDR_W'(0) : REG_ADDR_W'($urandom);
+    r.result = {$urandom, $urandom};
+    return r;
+  endfunction
+
+  function automatic exp_t golden_uc(md_rsp_t u);
+    exp_t e;
+    bit   writes;
+    // RV64M raises no exceptions, so the only reasons a unit result writes no
+    // register are the two that are left: it was not going to, or it names x0.
+    writes     = u.rd_we && (u.rd != '0);
+    e          = '{default: '0};
+    e.cb_we    = 1'b1;
+    e.cb_idx   = u.cb_idx;
+    e.upd.done       = 1'b1;
+    e.upd.norollback = 1'b1;
+    e.upd.from_main  = 1'b0;
+    e.upd.rd         = writes ? u.rd     : '0;
+    e.upd.rd_we      = writes;
+    e.upd.result     = writes ? u.result : '0;
+    e.fwd      = writes;
+    e.fwd_rd   = u.rd;
+    e.fwd_data = e.upd.result;
+    return e;
   endfunction
