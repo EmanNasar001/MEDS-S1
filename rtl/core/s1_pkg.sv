@@ -227,10 +227,15 @@ package s1_pkg;
   // response only has to name an entry, and that entry already records which
   // unit owns it.  The units themselves are T-02's; this is the shape of the
   // wire between them and WB.
+  // There is no `rd_we`.  #15's md_req_t has none either, so a unit would have
+  // nothing to derive one from and would tie it high; and RV64M has no
+  // multiply or divide that writes no register.  A destination of x0 is the
+  // only "no write" case and WB gates it.  Response mirrors request: an entry,
+  // a register, a value.  If md_req_t ever gains rd_we, this should regain it
+  // in the same change.
   typedef struct packed {
     logic [CB_IDX_W-1:0]   cb_idx;
     logic [REG_ADDR_W-1:0] rd;
-    logic                  rd_we;
     logic [XLEN-1:0]       result;
   } md_rsp_t;
 

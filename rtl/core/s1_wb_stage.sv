@@ -3,6 +3,9 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE file for details.
 // SPDX-License-Identifier: Apache-2.0
 //
+// Author(s)    : Eman Nasar (fatehulnasareman@gmail.com) (Sep 2026)
+// Modified By  :
+//
 // s1_wb_stage : WB stage -- completion arbitration and bypass       [WIP -- T-02]
 // Description  :
 // Stage five of the pipeline.  Every result the core produces reaches the
@@ -25,14 +28,21 @@
 module s1_wb_stage
   import s1_pkg::*;
 #(
-  parameter int unsigned N_READ = 2,    // ID operand read ports the bypass answers
   parameter int unsigned N_UC   = 2,    // multi-cycle completion channels (MUL, DIV)
   localparam int unsigned RR_W  = (N_UC > 1) ? $clog2(N_UC) : 1
 ) (
   input  logic                  clk_i,
   input  logic                  rst_ni,
 
-  input  logic                  flush_i,      // retire flush
+  // Retire flush ONLY -- a trap, an mret or a fence.i at the retire pointer.
+  //
+  // Never the branch mispredict.  #15 resolves a mispredict in EX and frees the
+  // completion-buffer entries younger than the branch (ex_redirect_cb_idx_o);
+  // everything in MEM and in MEM/WB is OLDER than the branch and must survive.
+  // Wiring that redirect here would discard an older instruction's completion
+  // and drain a unit whose result is still wanted, and nothing downstream would
+  // notice -- the entry simply never completes and the head never retires.
+  input  logic                  flush_i,
 
   // MEM/WB.  No ready: the entry was allocated in ID, so WB cannot refuse.
   input  logic                  wb_valid_i,
@@ -49,19 +59,15 @@ module s1_wb_stage
   output logic [CB_IDX_W-1:0]   cb_idx_o,
   output wb_upd_t               cb_upd_o,
 
-  // Forwarding to ID -- the MEM/WB source of SPEC 8.1's operand mux.  The
-  // compare lives here, with the value, so ID's operand mux stays a mux.
-  input  logic [REG_ADDR_W-1:0] fwd_raddr_i [N_READ],
-  output logic                  fwd_hit_o   [N_READ],
+  // SPEC 8.1's MEM/WB forwarding source: the value only.  s1_execute (#15)
+  // takes this as memwb_fwd_i; which operand reads it is decided in ID, and
+  // deliberately not here -- see the comment above the assignment.
   output logic [XLEN-1:0]       fwd_data_o,
 
   // Perf (SPEC 12): a multi-cycle result was held off by a busier channel.
   output logic                  uc_stall_o
 );
 
-  if (N_READ < 1) begin : g_bad_nread
-    $error("s1_wb_stage: N_READ must be at least 1");
-  end
   if (N_UC < 1) begin : g_bad_nuc
     $error("s1_wb_stage: N_UC must be at least 1; tie uc_valid_i[0] low if unused");
   end
@@ -170,10 +176,18 @@ module s1_wb_stage
   assign sel_result = main_takes ? wb_i.result : uc_sel.result;
 
   always_comb begin
-    if (main_takes) wr_reg = wb_i.rd_we   & ~wb_i.exc & (wb_i.rd   != '0);
+    if      (main_takes) wr_reg = wb_i.rd_we & ~wb_i.exc & (wb_i.rd != '0);
     // RV64M raises no exceptions -- divide by zero and signed overflow are
-    // defined results, not traps -- so a unit result has none to suppress.
-    else            wr_reg = uc_sel.rd_we &             (uc_sel.rd != '0);
+    // defined results, not traps -- and every multiply and divide writes its
+    // destination, so x0 is the only reason a unit result writes nothing.
+    //
+    // The uc_go term is load-bearing.  uc_gnt is computed from the requests
+    // alone, without regard to who holds the port, so uc_sel carries a channel's
+    // payload even in cycles when no unit is being accepted.  Without this the
+    // forwarding bus would present that value while cb_we_o was low, and EX
+    // would read a result for an instruction that had not completed.
+    else if (uc_go)      wr_reg = (uc_sel.rd != '0);
+    else                 wr_reg = 1'b0;
   end
 
   // ---------------------------------------------------------------------------
@@ -237,25 +251,27 @@ module s1_wb_stage
   end
 
   // ---------------------------------------------------------------------------
-  // Bypass to ID
+  // Bypass to ID (SPEC 8.1, the MEM/WB source)
   //
-  // This covers exactly one cycle.  The entry is written at the end of this
-  // cycle, so from the next one the completion buffer's own bypass (SPEC 8.1's
-  // fourth source) answers for it; until then nothing else can, because the
-  // value exists only on this port.  Without it every consumer of a load or a
-  // multi-cycle result would stall one cycle for a value already in hand.
+  // The value, and only the value.  There is no "does this match rs1" output
+  // here, and that omission is the contract:
+  //
+  //   cycle          t              t+1
+  //   ID             consumer C     -
+  //   EX/MEM reg     M              -
+  //   this module    P              M        <- fwd_data_o at t+1 is M's
+  //
+  // s1_execute (#15) fixes the forwarding select in ID and applies it in the
+  // consumer's first EX cycle, so a select made at t is spent at t+1, when this
+  // bus carries M -- the instruction sitting in the EX/MEM register at t, not
+  // the one this module completed at t.  A match computed here would compare
+  // against P and be exactly one instruction stale.  The ID-stage MEM/WB match
+  // belongs with the EX/MEM register, where M is visible.
+  //
+  // The value is already gated: it is the same signal the completion buffer is
+  // told to write, so a trapping instruction, an instruction with no
+  // destination and a destination of x0 all read as zero here.
   // ---------------------------------------------------------------------------
-  logic fwd_valid;
-
-  assign fwd_valid  = cb_we_o & wr_reg;
   assign fwd_data_o = cb_upd_o.result;
-
-  always_comb begin
-    for (int unsigned k = 0; k < N_READ; k++) begin
-      // `fwd_valid` already excludes x0, so a read of x0 cannot match and ID
-      // keeps the register file's hard zero.
-      fwd_hit_o[k] = fwd_valid & (fwd_raddr_i[k] == sel_rd);
-    end
-  end
 
 endmodule
