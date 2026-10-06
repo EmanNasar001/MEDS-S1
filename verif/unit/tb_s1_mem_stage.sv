@@ -320,14 +320,28 @@ module tb_s1_mem_stage
           int unsigned n = 1 << h.lg, off = int'(h.ex.mem_addr[OW-1:0]);
           logic [2*XLEN-1:0] w;
           logic [2*BB-1:0]   bm;
+          drain_t            d_lo, d_hi;
           commit     = 1'b1;
           commit_idx = h.ex.cb_idx;
           for (int unsigned k = 0; k < n; k++) arch[h.ex.mem_addr + k] = h.wv[8*k +: 8];
           bm = (((2*BB)'(1) << n) - 1) << off;
           w  = (2*XLEN)'(h.wv) << (8*off);
-          drq.push_back('{h.ex.mem_addr, bm[BB-1:0], w[XLEN-1:0], h.priv, bm[2*BB-1:BB] == 0});
-          if (bm[2*BB-1:BB] != 0)
-            drq.push_back('{((h.ex.mem_addr >> OW) + 1) << OW, bm[2*BB-1:BB], w[2*XLEN-1:XLEN], h.priv, 1});
+          // Built field by field: 5.020 cannot width an assignment pattern
+          // passed as an argument.
+          d_lo.addr    = h.ex.mem_addr;
+          d_lo.be      = bm[BB-1:0];
+          d_lo.wdata   = w[XLEN-1:0];
+          d_lo.mode    = h.priv;
+          d_lo.last    = (bm[2*BB-1:BB] == 0);
+          drq.push_back(d_lo);
+          if (bm[2*BB-1:BB] != 0) begin
+            d_hi.addr  = ((h.ex.mem_addr >> OW) + 1) << OW;
+            d_hi.be    = bm[2*BB-1:BB];
+            d_hi.wdata = w[2*XLEN-1:XLEN];
+            d_hi.mode  = h.priv;
+            d_hi.last  = 1'b1;
+            drq.push_back(d_hi);
+          end
         end
         void'(cb.pop_front());
       end

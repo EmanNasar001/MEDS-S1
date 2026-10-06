@@ -16,8 +16,8 @@ The MEM stage of the five-stage pipeline. It takes one instruction per cycle fro
 register that `s1_execute` fills (#15) and does everything SPEC §7.4 puts in MEM:
 
 - D$ access over I2 MEM-REQ, for loads, LR and AMO reads;
-- PMP checks (here) and PMA checks (attributes from the generated decoder), in parallel with the
-  access;
+- PMP checks (via `s1_pmp`) and PMA checks (attributes from the generated decoder), in parallel
+  with the access;
 - store-buffer allocation, so a write reaches memory only after its instruction retires (SPEC §14);
 - AMO and LR/SC sequencing.
 
@@ -40,7 +40,7 @@ everything WB, the completion buffer and RVFI need.
 | `cb_head_idx_i` | in | `CB_IDX_W` | CB head | holds non-idempotent reads back (P1) |
 | `sb_commit_i`, `sb_commit_idx_i` | in | 1, `CB_IDX_W` | a write retires | one per cycle; the index of a `wb_o.sb_alloc` completion |
 | `mxif_mem_busy_i` | in | 1 | coprocessor memory outstanding | INTERFACES.md §1.5 interlock |
-| `pmpcfg_i`, `pmpaddr_i` | in | `PMP_REGIONS`×8, ×`PLEN-2` | PMP CSRs | WARL legalisation (granularity, locked-entry writes) is the CSR file's job |
+| `pmpcfg_i`, `pmpaddr_i` | in | `PMP_REGIONS`×8, ×`PLEN-2` | PMP CSRs | passed straight to `s1_pmp`; WARL legalisation (granularity, locked-entry writes) is the CSR file's job |
 | `pma_addr_o`, `pma_size_o` | out | `XLEN`, 3 | the access in MEM | `size` is log2 bytes |
 | `pma_i`, `pma_fault_i` | in | `pma_t`, 1 | region attributes; unmapped or width not allowed | **combinational** from `pma_addr_o`/`pma_size_o` |
 | `dmem_req_*` | out/in | `mem_req_t` | I2 request | `valid` never depends on `ready`; payload stable while stalled |
@@ -84,7 +84,7 @@ a straddling read, a drain, or a held request; store buffer full (writes and AMO
 | Parameter | Default | Legal range | Effect |
 |---|---|---|---|
 | `STORE_BUF_N` | `SB_DEPTH` (4) | ≥ 1 (elaboration error below) | store-buffer entries |
-| `PMP_REGIONS` | `PMP_N` (16) | 0–64 | implemented PMP entries; with 0, S/U accesses are not PMP-restricted |
+| `PMP_REGIONS` | `PMP_N` (16) | 0–64 | implemented PMP entries, forwarded to `s1_pmp`; with 0, S/U accesses are not PMP-restricted |
 
 ## Behaviour
 
@@ -103,9 +103,9 @@ a straddling read, a drain, or a held request; store buffer full (writes and AMO
 **Checks.** An access faults on `pma_fault_i`, on misalignment in an `align_natural` region (P3), on
 LR/SC in a region without `atomic_lrsc` or AMO without `atomic_amo`, or on a PMP denial. Loads and
 LR raise `EXC_LOAD_ACCESS_FAULT`; stores, SC and AMO raise `EXC_STORE_ACCESS_FAULT` (an AMO needs
-both R and W). PMP follows the privileged spec: the lowest-numbered entry matching any byte decides
-and must match every byte; M-mode is bound only by locked entries; no match lets M through and
-stops S/U. Bounds use `XLEN+2`-bit compares, so a NAPOT entry covering the whole space works.
+both R and W, so it asks `s1_pmp` for both). The PMP rules themselves, and their verification, are
+on the [`s1_pmp` page](s1_pmp.md); MEM supplies the address, the size and the R/W request, ties
+`ex_i` low, and turns a denial into the right fault code.
 
 **Byte windows and forwarding.** An access covers at most two 8-byte I2 beats and is kept as a
 16-bit byte mask plus 128 bits of data. A read merges every older pending store, oldest first, so
@@ -159,9 +159,9 @@ MEM catch unmapped and misaligned writes before that.
 
 | Layer | Status | Where |
 |---|---|---|
-| Lint | clean, no waivers | `make lint` |
+| Lint | clean, no waivers, all four configs | `make lint CONFIG=…` |
 | Unit test | **891 978 checks**; also passes with `SB_DEPTH` 1, 2 and 8 | `verif/unit/tb_s1_mem_stage.sv` |
-| Mutation | 24 hand-inserted bugs, 24 caught | table below |
+| Mutation | 20 hand-inserted bugs, 20 caught — re-run after the `s1_pmp` split (4 PMP mutants moved to `tb_s1_pmp`) | table below |
 | Integration, co-simulation, arch tests | not yet | needs #4, #15 and the rest of the core |
 
 The testbench plays EX, the completion buffer (head, commit, flush, random interrupts), the CSR file
@@ -195,7 +195,17 @@ byte map.
   1063, bus errors 31 / 32, faults 2902 (PMP 977, misalign 235, atomics 679), EX exceptions 959,
   interlock 1083, LR 772, SC success 123 / failure 1277, AMO 1234.
 
-Mutants, each a copy of `s1_mem_stage.sv` with one change:
+**Tool versions.** The numbers below are from Verilator 5.036. The CI gate installs **5.020**,
+which is stricter in two places this module tripped: a cast propagating its context into an `&`
+(`WIDTHEXPAND`), and an assignment pattern used as a function argument in the testbench
+(`Unsupported`, then an internal error). Both are fixed by removing the construct rather than
+waiving it, so the gate should now reach the same numbers — but they have not been reproduced on
+5.020 locally, because only 5.036 is installed here.
+
+Mutants, each a lint-clean copy of `s1_mem_stage.sv` with one change. Three of them had to be
+rewritten: dropping a term outright left a signal unread, which `-Wall` rejects before the
+testbench runs, so the held-request, SC-size and AMO-operand mutants corrupt the logic instead of
+deleting it (reload each cycle, `<=` instead of `==`, zero- instead of sign-extend).
 
 | Mutant | Bug injected | Caught by |
 |---|---|---|
@@ -209,10 +219,6 @@ Mutants, each a copy of `s1_mem_stage.sv` with one change:
 | hold unstable | a stalled request follows the instruction in MEM | R-C10 stability check |
 | valid on ready | `dmem_req_valid_o` gated by `dmem_req_ready_i` | R-C10 probe |
 | complete during flush | `wb_valid_o` not suppressed by `flush_i` | "completion has an owner" |
-| PMP last entry wins | a higher-numbered entry overrides a lower one | occupancy model / scoreboard |
-| PMP ignores lock | M-mode ignores locked entries | scoreboard |
-| PMP any, not all | a partial match passes | read-owner check |
-| NAPOT one short | NAPOT region half its size | scoreboard (`exc`) |
 | no alignment check | P3 misalignment not faulted | read-owner check |
 | no atomics check | LR/SC/AMO in regions without atomics | read-owner check |
 | AMO skips W permission | AMO checked as a read only | scoreboard (`sb_alloc`) |
@@ -226,6 +232,15 @@ Mutants, each a copy of `s1_mem_stage.sv` with one change:
 
 ## Known limitations
 
+- **The load/store path here is provisional.** R-02 splits the LSU from the MEM stage, and the LSU
+  is being built separately; this stage carries its own request/response/extend path only because it
+  cannot run without one. When that LSU lands, the aligned single-beat part of this path is replaced
+  by it, and `s1_store_buffer` is split out at the same time. Two things will have to grow for that
+  to work: the bus port here is arbitrated three ways — a new read, a committed store-buffer drain,
+  and the second beat of a straddling access — and reads need a forwarding hook so that bytes
+  already covered by a pending store are not fetched. Neither fits a single-outstanding-request
+  design.
+
 - **No Zicbom.** `decoded_op_t` (#4) now defines `is_cbo` and `cbo_op`, but MEM does not act on
   them: `cbo.*` will issue here and must be ordered with the store buffer.
 - **Forwarding is by address.** A load through `dram` after a store through `dram_uncached` of the
@@ -234,7 +249,7 @@ Mutants, each a copy of `s1_mem_stage.sv` with one change:
 - **Same-hart writes do not break a reservation**, and a flush or SC always clears it. Both are
   permitted by the A extension; a flush between LR and SC makes the SC fail.
 - **One outstanding I2 request**; with a slower D$, throughput is one access per hit latency.
-- **Critical paths:** PMP (16 × two 66-bit compares) and PMA → `mem_ready_o`/`dmem_req_valid_o`;
+- **Critical paths:** `s1_pmp` (16 × two 66-bit compares) and PMA → `mem_ready_o`/`dmem_req_valid_o`;
   store-buffer compares → `need_lo/hi`; I2 `rdata` → merge → extend (and AMO compute) → `wb_o`.
   PMP on the MEM address in parallel with the D$ request is SPEC §11's arrangement; if it does not
   meet timing, registering the PMP result is the first thing to try.

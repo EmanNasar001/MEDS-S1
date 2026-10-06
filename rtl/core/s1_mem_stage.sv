@@ -7,7 +7,7 @@
 // Description  :
 // Takes one instruction per cycle from EX/MEM.  Reads are fetched over I2
 // MEM-REQ and merged byte-wise with pending stores; writes enter a commit-gated
-// store buffer and reach memory only after retire.  PMP is checked here, PMA
+// store buffer and reach memory only after retire.  PMP is checked by s1_pmp, PMA
 // attributes come from the generated decoder.  Owns the MEM/WB register: a read
 // completes in the cycle its last response arrives.
 // Contract and timing: docs/modules/s1_mem_stage.md.
@@ -78,7 +78,6 @@ module s1_mem_stage
   localparam int unsigned WIN_W      = 2 * XLEN;
   localparam int unsigned LG_W       = $clog2(OFF_W + 1);
   localparam int unsigned CNT_W      = $clog2(STORE_BUF_N + 1);
-  localparam int unsigned CMP_W      = XLEN + 2;          // PMP bounds may exceed 2**XLEN
 
   if (STORE_BUF_N < 1) begin : g_bad_sb
     $error("s1_mem_stage: STORE_BUF_N must be at least 1");
@@ -149,7 +148,11 @@ module s1_mem_stage
   assign in_beat = in_addr[XLEN-1:OFF_W];
   assign in_off  = in_addr[OFF_W-1:0];
   assign in_mask = acc_mask(in_off, in_lg);
-  assign in_wdata = (WIN_W'(mem_i.mem_wdata & size_mask(in_lg)) << (32'(in_off) * BYTE_W));
+  // Mask at XLEN, then widen.  As one expression the cast propagates into the
+  // AND and 5.020 calls both operands too narrow.
+  logic [XLEN-1:0]      in_wdata_masked;
+  assign in_wdata_masked = mem_i.mem_wdata & size_mask(in_lg);
+  assign in_wdata        = WIN_W'(in_wdata_masked) << (32'(in_off) * BYTE_W);
 
   // SC without a matching reservation fails without touching memory, as Sail does.
   logic            res_valid_q;
@@ -161,54 +164,22 @@ module s1_mem_stage
   assign pma_addr_o = in_addr;
   assign pma_size_o = 3'(in_lg);
 
-  // PMP (privileged spec 3.7): the lowest-numbered entry matching any byte
-  // decides, and must match every byte.  No match: M passes, S/U fail.
+  // PMP lives in its own module: the fetch path needs the same check on the
+  // instruction address, and a check that can be unit-tested on its own is
+  // worth more than one buried in a pipeline stage.
   logic pmp_ok;
-  always_comb begin
-    logic [CMP_W-1:0] a_lo, a_hi, r_lo, r_hi;
-    logic [PA_W-1:0]  tmask;
-    logic [PA_W:0]    nmask, base_u;
-    logic [PA_W+1:0]  top_u;
-    logic             hit, any, all;
-    a_lo   = CMP_W'(in_addr);
-    a_hi   = a_lo + (CMP_W'(1) << in_lg);
-    pmp_ok = (priv_i == PRIV_M) || (PMP_REGIONS == 0);
-    hit    = 1'b0;
-    for (int unsigned i = 0; i < PMP_REGIONS; i++) begin
-      r_lo  = '0;
-      r_hi  = '0;
-      tmask = '0;
-      nmask = '0;
-      base_u = '0;
-      top_u  = '0;
-      unique case (pmpcfg_i[i][4:3])
-        2'b01: begin                                              // TOR
-          r_lo = (i == 0) ? '0 : CMP_W'(pmpaddr_i[(i == 0) ? 0 : i - 1]) << 2;
-          r_hi = CMP_W'(pmpaddr_i[i]) << 2;
-        end
-        2'b10: begin                                              // NA4
-          r_lo = CMP_W'(pmpaddr_i[i]) << 2;
-          r_hi = r_lo + CMP_W'(4);
-        end
-        2'b11: begin                                              // NAPOT
-          tmask = pmpaddr_i[i] & ~(pmpaddr_i[i] + PA_W'(1));
-          nmask = {tmask, 1'b1};
-          base_u = {1'b0, pmpaddr_i[i]} & ~nmask;
-          top_u  = {1'b0, ({1'b0, pmpaddr_i[i]} | nmask)} + (PA_W+2)'(1);
-          r_lo   = CMP_W'(base_u) << 2;
-          r_hi   = CMP_W'(top_u) << 2;
-        end
-        default: ;
-      endcase
-      any = (pmpcfg_i[i][4:3] != 2'b00) && (r_lo < r_hi) && (a_lo < r_hi) && (a_hi > r_lo);
-      all = (a_lo >= r_lo) && (a_hi <= r_hi);
-      if (!hit && any) begin
-        hit    = 1'b1;
-        pmp_ok = all && ((priv_i == PRIV_M && !pmpcfg_i[i][7])
-                         || ((!rd_acc || pmpcfg_i[i][0]) && (!wr_acc || pmpcfg_i[i][1])));
-      end
-    end
-  end
+
+  s1_pmp #(.REGIONS(PMP_REGIONS)) u_pmp (
+    .addr_i    (in_addr),
+    .size_i    (3'(in_lg)),
+    .rd_i      (rd_acc),
+    .wr_i      (wr_acc),
+    .ex_i      (1'b0),          // MEM never fetches
+    .priv_i    (priv_i),
+    .pmpcfg_i  (pmpcfg_i),
+    .pmpaddr_i (pmpaddr_i),
+    .allow_o   (pmp_ok)
+  );
 
   logic in_mem, misalign, atomic_bad, in_fault, in_ok_read, in_ok_write;
   logic [5:0] fault_code;
@@ -697,7 +668,6 @@ module s1_mem_stage
   logic unused_inputs;
   always_comb begin
     unused_inputs = ^{dmem_rsp_i.id, dmem_rsp_i.errcode, mem_i.aq, mem_i.rl, pma_i.cacheable};
-    for (int unsigned i = 0; i < PMP_W; i++) unused_inputs ^= ^{pmpcfg_i[i][6:5], pmpcfg_i[i][2]};
   end
 
 endmodule

@@ -144,8 +144,8 @@ package s1_pkg;
   } mem_rsp_t;
 
   // ---------------------------------------------------------------------------
-  // EX/MEM types the memory stage consumes, copied verbatim from #15 (execute).
-  // Delete this copy when rebasing onto #15, which defines them.
+  // EX/MEM types the memory stage consumes, copied verbatim from the execute
+  // stage.  Delete this copy when rebasing onto the PR that lands them.
   // ---------------------------------------------------------------------------
 
   // Load/store operand width, ID-stage view. The LSU, not the
