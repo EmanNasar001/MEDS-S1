@@ -589,7 +589,10 @@ module tb_s1_mem_stage
     script.push_back(I(K_LOAD, 3, DRAM + 64'h50));
     drain();
 
-    foreach (soaks[k]) begin
+    // An explicit loop, not `foreach`: over an array of unpacked structs the
+    // 5.020 codegen emits a loop guard that ANDs against the element rather
+    // than the index, which does not compile.  An array of enums is fine.
+    for (int k = 0; k < $size(soaks); k++) begin
       $display("[random] soak %0d: ready %0d%%, latency <=%0d, retire %0d%%, irq %0d/1000, block %0d%%, pmp %s",
                k, soaks[k].rdy, soaks[k].lat, soaks[k].ret, soaks[k].irq, soaks[k].blk,
                soaks[k].fuzz ? "fuzzed" : "default");
