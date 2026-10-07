@@ -441,11 +441,19 @@ module tb_s1_mem_stage
   // ---------------------------------------------------------------------------
   // Tests
   // ---------------------------------------------------------------------------
-  typedef struct { int rdy, lat, ret, irq, blk, fuzz; } soak_t;
 
   initial begin
     int s0, rd0, wr0, e0;
-    soak_t soaks[3] = '{'{100, 1, 70, 5, 0, 0}, '{60, 3, 40, 10, 3, 1}, '{25, 6, 15, 5, 5, 1}};
+    // The three soak configurations, as parallel integer arrays rather than an
+    // array of structs: indexing an unpacked struct array makes the 5.020
+    // codegen emit a guarded select that drops the index and the field, which
+    // then does not compile.  Integer and enum arrays are unaffected.
+    int sk_rdy [3] = '{100,  60,  25};   // I2 grant probability, %
+    int sk_lat [3] = '{  1,   3,   6};   // response latency, cycles
+    int sk_ret [3] = '{ 70,  40,  15};   // retire probability, %
+    int sk_irq [3] = '{  5,  10,   5};   // interrupts per 1000
+    int sk_blk [3] = '{  0,   3,   5};   // coprocessor-busy probability, %
+    int sk_fuz [3] = '{  0,   1,   1};   // fuzz the PMP map
     amo_op_e amos[9] = '{AMO_SWAP, AMO_ADD, AMO_XOR, AMO_AND, AMO_OR, AMO_MIN, AMO_MAX, AMO_MINU, AMO_MAXU};
 
     ex = '0; ex_valid = 0; priv = PRIV_M; head_idx = '0; commit = 0; commit_idx = '0; flush = 0;
@@ -589,17 +597,14 @@ module tb_s1_mem_stage
     script.push_back(I(K_LOAD, 3, DRAM + 64'h50));
     drain();
 
-    // An explicit loop, not `foreach`: over an array of unpacked structs the
-    // 5.020 codegen emits a loop guard that ANDs against the element rather
-    // than the index, which does not compile.  An array of enums is fine.
-    for (int k = 0; k < $size(soaks); k++) begin
+    for (int k = 0; k < 3; k++) begin
       $display("[random] soak %0d: ready %0d%%, latency <=%0d, retire %0d%%, irq %0d/1000, block %0d%%, pmp %s",
-               k, soaks[k].rdy, soaks[k].lat, soaks[k].ret, soaks[k].irq, soaks[k].blk,
-               soaks[k].fuzz ? "fuzzed" : "default");
+               k, sk_rdy[k], sk_lat[k], sk_ret[k], sk_irq[k], sk_blk[k],
+               sk_fuz[k] ? "fuzzed" : "default");
       ideal();
-      if (soaks[k].fuzz) pmp_fuzz(); else pmp_default();
-      p_rdy = soaks[k].rdy; lat_max = soaks[k].lat; p_retire = soaks[k].ret;
-      p_irq = soaks[k].irq; p_block = soaks[k].blk; gen_random = 1;
+      if (sk_fuz[k]) pmp_fuzz(); else pmp_default();
+      p_rdy = sk_rdy[k]; lat_max = sk_lat[k]; p_retire = sk_ret[k];
+      p_irq = sk_irq[k]; p_block = sk_blk[k]; gen_random = 1;
       run(20000);
       drain();
     end
