@@ -37,10 +37,14 @@ module tb_s1_wb_stage
   mem_wb_t wb;
 
   // One master stimulus set, fanned out to the three widths.
-  logic    ucv1 [1], ucv2 [2], ucv3 [3];
-  md_rsp_t ucd1 [1], ucd2 [2], ucd3 [3];
+  // Packed, not unpacked arrays: Verilator 5.020 -- the version the CI gate
+  // installs -- does not propagate a write to one element of an unpacked-array
+  // input port, so every channel read as zero and 309 013 checks failed there
+  // while passing on 5.036.  Packed array ports behave on both.
+  logic [0:0] ucv1; logic [1:0] ucv2; logic [2:0] ucv3;
+  md_rsp_t [0:0] ucd1; md_rsp_t [1:0] ucd2; md_rsp_t [2:0] ucd3;
 
-  logic    uc_ready [2], uc_ready1 [1], uc_ready3 [3];
+  logic [1:0] uc_ready; logic [0:0] uc_ready1; logic [2:0] uc_ready3;
   logic    uc_stall, uc_stall1, uc_stall3;
 
   logic                  cb_we,  cb_we1,  cb_we3;

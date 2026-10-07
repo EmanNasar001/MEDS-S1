@@ -120,6 +120,13 @@ often than DIV and would starve it for as long as a multiply-heavy loop runs. Th
 pointer and turns "no channel waits for ever" into something the testbench checks rather than a
 claim about workloads.
 
+**The grant is computed before the port is known to be free.** `uc_gnt` is ranked from the rotation
+pointer over the requests alone, without regard to whether the main pipe has taken the port, so the
+selected channel's payload is live even in cycles when no unit is being accepted. The register write
+and the forwarding bus are therefore gated on `uc_go` — the grant *and* a free port — not on the
+grant alone. Without that term the forwarding bus presents a unit's result while `cb_we_o` is low,
+and EX reads a value for an instruction that has not completed. It is one of the mutants.
+
 **A flush drains every unit at once.** `uc_ready_o` is 1 on every channel in a flush cycle and
 nothing is written. A unit holding a result for an entry the flush removed would otherwise wait for
 a ready that will never mean anything, and would never free itself — a stall that outlives the
