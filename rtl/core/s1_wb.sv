@@ -31,9 +31,8 @@
 // Interrupts are taken here too, in place of a commit, so mepc names an
 // instruction that has not executed.
 //
-// Reference: SPEC 7.5, 10.3, 28.2.
-// Testbench: the integration testbench that lands with s1_core -- this module
-// has no unit testbench of its own.
+// Reference: SPEC 7.5, 10.3, 28.2.  Testbench: core/verif/tb_s1_core.sv (integration;
+// interrupts are not yet exercised).
 // =============================================================================
 
 module s1_wb
