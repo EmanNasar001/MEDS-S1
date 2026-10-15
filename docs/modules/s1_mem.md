@@ -32,15 +32,15 @@ register and produces one `mem_wb_t` per instruction.
 | `oldest_tag_i` | in | `TAG_W` | oldest in-flight tag | holds non-idempotent reads back (P1) |
 | `sb_commit_i`, `sb_commit_tag_i` | in | 1, `TAG_W` | a write retired | one per cycle |
 | `chk_*_o` | out | — | the access in MEM, as a query | **answered combinationally in the same cycle** |
-| `pma_i`, `pma_fault_i`, `pmp_allow_i` | in | `pma_t`, 1, 1 | the two checkers' answers | both checkers are **outside this core**; `s1_pmp` is the PMP one |
+| `pma_i`, `pma_fault_i`, `pmp_allow_i` | in | `pma_t`, 1, 1 | the two checkers' answers | both checkers are **outside this core** |
 | `dmem_*` | out/in | I2 MEM-REQ | D$ port | `valid` never depends on `ready`; payload stable while stalled; `rsp_ready` constant 1 |
 | `sb_empty_o`, `sb_full_o` | out | 1 | store buffer status | `fence` waits on empty; full is a perf event |
 | `store_err_o`, `store_err_addr_o` | out | 1, `XLEN` | a retired write got a bus error | one-cycle pulse; **imprecise** |
 
 **Both physical-memory checks are external.** One query describes the access; two independent
 checkers answer in the same cycle, in parallel with the D$ tag lookup. PMA comes from the generated
-decoder, PMP from [`s1_pmp`](s1_pmp.md) reading the CSRs. Neither is inside the core, which is what
-lets the fetch path share the same PMP checker.
+decoder, PMP from a checker reading the CSRs. Neither is inside the core, which is what lets the
+fetch path share the same PMP checker.
 
 ## Parameters
 

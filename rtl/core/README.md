@@ -28,7 +28,7 @@ Status tags follow CODING_STANDARD.md §5. This table is the fastest way to see 
 | `s1_mxif_port.sv` | TODO | **R-01 (critical path)** | | |
 | `s1_mem.sv` | WIP — integration-verified against spike | R-02 | via the `s1_core` integration testbench | [page](../../docs/modules/s1_mem.md) |
 | `s1_lsu.sv` | TODO | R-02 | | |
-| `s1_pmp.sv` | WIP — unit-verified; the external PMP checker `s1_mem` and the fetch path query | R-02 | `tb_s1_pmp` (121067 checks) | [page](../../docs/modules/s1_pmp.md) |
+| `s1_pmp.sv` | TODO | R-02 | | |
 | `s1_core.sv` | TODO | T-02 / R-01 | | |
 
 ## Rules specific to this directory

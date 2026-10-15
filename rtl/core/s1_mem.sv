@@ -13,9 +13,8 @@
 // Contract and timing: docs/modules/s1_mem.md.
 //
 // Reference: SPEC 7.4, 11, 14; INTERFACES.md 1.5, 2, 9 (P1-P3); RISC-V A, PMP.
-// Testbench: the integration testbench that lands with s1_core -- this module
-// has no unit testbench of its own.  AMO, LR/SC, faults and straddling accesses
-// are not reached by an RV64I program.
+// Testbench: core/verif/tb_s1_core.sv (integration; AMO, LR/SC, faults and straddling
+// accesses are not reached by its RV64I program).
 // =============================================================================
 
 module s1_mem
