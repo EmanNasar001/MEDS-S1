@@ -2,12 +2,12 @@
 
 | | |
 |---|---|
-| **Status** | WIP — integration-verified; no unit testbench |
+| **Status** | WIP — unit- and integration-verified |
 | **Authorship** | see the file header (`Author(s)` / `Modified By`) — CODING_STANDARD.md §5 |
 | **Project** | T-02 (core backend) |
 | **Spec** | SPEC §7.5, §10.3, §28.2 |
 | **Source** | `rtl/core/s1_wb.sv` |
-| **Testbench** | the integration testbench that lands with `s1_core`; none of its own |
+| **Testbench** | `verif/unit/tb_s1_wb.sv` (336,505 checks), plus the integration testbench that lands with `s1_core` |
 
 ## Purpose
 
@@ -75,23 +75,36 @@ because this is the only place architectural state changes.
 | Layer | Status |
 |---|---|
 | Lint | clean once the shared types are available |
-| Unit test | **none** — this module has no unit testbench |
+| Unit test | `tb_s1_wb` — 336,505 checks, every output against an independent model |
+| Mutation | 20 of 20 lint-clean mutants caught |
 | Integration | every retirement compared against spike, over the whole pipeline |
 
-Verified **through the integrated core**: an RV64I program and a C sorting workload run through the
-whole pipeline with every retirement compared against spike on RVFI, with ideal memory and under
-random I$/D$ backpressure and latency.
+**Unit test.** The stage is combinational, and nine inputs decide what it does, so the unit
+testbench sweeps that control space **exhaustively** — valid, interrupt, store-buffer-empty,
+exception, all ten `sys_op` values, `rd_we`, `rd == x0`, `csr_we` and `sb_alloc` — with a fresh
+random payload on each of the 5,120 combinations, then 4,000 fully random cycles on top. Every
+output is compared against a model written from the commit rules rather than from the RTL.
 
-**What integration does not reach.** No trap is taken (`ecall`/`ebreak` are not in the programs), no
-interrupt is raised, and `fence` is not held against a non-empty store buffer. Those paths are
-written and lint-clean but unverified — which matters here more than in most modules, because the
-trap path is the one that must *not* write architectural state.
+Alongside the value comparisons it asserts the contract directly, so a check fails even where the
+model and the RTL would agree on a shared mistake:
+
+- a trap suppresses **all three** writes — register file, CSR and the store-buffer commit — and does
+  not retire
+- a held fence is completely quiet **and still reports `busy_o`**; quiet but not busy is a hang,
+  because ID stops serialising and the fence is lost
+- an interrupt replaces a commit rather than following one, so `mepc` names an instruction that has
+  not executed and `minstret` does not count it
+- `x0` is never written, on any path
+
+**Integration** then runs an RV64I program and a C sorting workload through the whole pipeline with
+every retirement compared against spike on RVFI, under random I$/D$ backpressure and latency.
+
+**What neither layer reaches.** The unit testbench drives `irq_valid_i` directly, so it proves what
+this stage does with an interrupt, not that the CSR file masks and prioritises one correctly — that
+belongs to T-03. `trap_vec_i` and `mepc_i` are likewise supplied, not computed.
 
 ## Known limitations
 
-- **No unit testbench.** The trap, interrupt and fence paths are the cost. A unit testbench for this
-  module was written against an earlier interface — one that wrote into a completion buffer rather
-  than committing directly — and did not survive the move to the integrated in-order design.
 - **One commit per cycle, in order.** There is no completion buffer, so a multi-cycle unit cannot
   complete out of order: EX stalls on `md_*` until it answers, and the result travels down EX/MEM
   like any other. That is a deliberate simplification of SPEC §9, not an oversight.
