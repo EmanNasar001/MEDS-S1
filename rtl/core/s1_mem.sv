@@ -3,26 +3,25 @@
 // Licensed under the Apache License, Version 2.0, see LICENSE file for details.
 // SPDX-License-Identifier: Apache-2.0
 //
-// s1_mem_stage : MEM stage -- D$ access, PMP/PMA, store buffer, AMO/LR/SC  [WIP -- R-02]
+// s1_mem       : MEM stage -- D$ access, store buffer, AMO/LR/SC  [WIP -- R-02]
 // Description  :
 // Takes one instruction per cycle from EX/MEM.  Reads are fetched over I2
 // MEM-REQ and merged byte-wise with pending stores; writes enter a commit-gated
-// store buffer and reach memory only after retire.  PMP is checked by s1_pmp, PMA
-// attributes come from the generated decoder.  Owns the MEM/WB register: a read
-// completes in the cycle its last response arrives.
-// Contract and timing: docs/modules/s1_mem_stage.md.
+// store buffer and reach memory only after retire.  PMP and PMA are answered by
+// checkers outside the core, through the chk_* query.  Owns the MEM/WB register:
+// a read completes in the cycle its last response arrives.
+// Contract and timing: docs/modules/s1_mem.md.
 //
 // Reference: SPEC 7.4, 11, 14; INTERFACES.md 1.5, 2, 9 (P1-P3); RISC-V A, PMP.
-// Testbench: verif/unit/tb_s1_mem_stage.sv.
+// Testbench: the integration testbench that lands with s1_core -- this module
+// has no unit testbench of its own.  AMO, LR/SC, faults and straddling accesses
+// are not reached by an RV64I program.
 // =============================================================================
 
-module s1_mem_stage
+module s1_mem
   import s1_pkg::*;
 #(
-  parameter int unsigned STORE_BUF_N = SB_DEPTH,
-  parameter int unsigned PMP_REGIONS = PMP_N,
-  localparam int unsigned PMP_W      = (PMP_REGIONS > 0) ? PMP_REGIONS : 1,
-  localparam int unsigned PA_W       = PLEN - 2          // pmpaddr CSR width
+  parameter int unsigned STORE_BUF_N = SB_DEPTH
 ) (
   input  logic                          clk_i,
   input  logic                          rst_ni,
@@ -38,22 +37,26 @@ module s1_mem_stage
   // MEM/WB (CB entries are allocated in ID, so WB never refuses)
   output logic                          wb_valid_o,
   output mem_wb_t                       wb_o,
+  output logic                          wb_pend_o,        // MEM/WB holds a read still owed by the bus
 
   // Completion buffer
-  input  logic [CB_IDX_W-1:0]           cb_head_idx_i,
+  input  logic [TAG_W-1:0]           oldest_tag_i,   // oldest in-flight tag: WB's, else MEM's
   input  logic                          sb_commit_i,
-  input  logic [CB_IDX_W-1:0]           sb_commit_idx_i,
-  input  logic                          mxif_mem_busy_i,  // INTERFACES.md 1.5 interlock
+  input  logic [TAG_W-1:0]           sb_commit_tag_i,
 
-  // PMP configuration from the CSR file
-  input  logic [PMP_W-1:0][7:0]         pmpcfg_i,
-  input  logic [PMP_W-1:0][PA_W-1:0]    pmpaddr_i,
+  // ---- Physical-memory checks, both external (SPEC 11) --------------------
+  // One query describes the access in MEM; two independent checkers answer it
+  // in the same cycle, in parallel with the D$ tag lookup.  Neither is in this
+  // core -- see docs/modules/s1_core.md.
+  output logic [XLEN-1:0]               chk_addr_o,
+  output logic [2:0]                    chk_size_o,       // log2 bytes
+  output logic                          chk_rd_o,         // needs R
+  output logic                          chk_wr_o,         // needs W
+  output priv_lvl_e                     chk_priv_o,       // effective mode, after MPRV
 
-  // PMA of the access in MEM, from the generated decoder (combinational)
-  output logic [XLEN-1:0]               pma_addr_o,
-  output logic [2:0]                    pma_size_o,
-  input  pma_t                          pma_i,
+  input  pma_t                          pma_i,            // attributes of the region
   input  logic                          pma_fault_i,      // unmapped, or width not allowed
+  input  logic                          pmp_allow_i,      // PMP permits this access
 
   // D$ port (I2 MEM-REQ)
   output logic                          dmem_req_valid_o,
@@ -80,7 +83,7 @@ module s1_mem_stage
   localparam int unsigned CNT_W      = $clog2(STORE_BUF_N + 1);
 
   if (STORE_BUF_N < 1) begin : g_bad_sb
-    $error("s1_mem_stage: STORE_BUF_N must be at least 1");
+    $error("s1_mem: STORE_BUF_N must be at least 1");
   end
 
   function automatic logic [WIN_BYTES-1:0] acc_mask(logic [OFF_W-1:0] off, logic [LG_W-1:0] lg);
@@ -137,9 +140,9 @@ module s1_mem_stage
   logic [WIN_BYTES-1:0] in_mask;
   logic [WIN_W-1:0]     in_wdata;
 
-  assign is_lr   = mem_i.is_amo && mem_i.amo_op == AMO_LR;
-  assign is_sc   = mem_i.is_amo && mem_i.amo_op == AMO_SC;
-  assign is_amox = mem_i.is_amo && !is_lr && !is_sc && mem_i.amo_op != AMO_NONE;
+  assign is_lr   = (mem_i.amo_op == AMO_LR);
+  assign is_sc   = (mem_i.amo_op == AMO_SC);
+  assign is_amox = (mem_i.amo_op != AMO_NONE) && !is_lr && !is_sc;
   assign rd_acc  = mem_i.is_load  || is_lr || is_amox;
   assign wr_acc  = mem_i.is_store || is_sc || is_amox;
   assign in_sext = mem_i.is_load ? mem_i.mem_signed : 1'b1;   // LR and AMO results sign-extend
@@ -161,25 +164,18 @@ module s1_mem_stage
   logic            sc_skip;
   assign sc_skip = is_sc && !(res_valid_q && res_addr_q == in_addr && res_lg_q == in_lg);
 
-  assign pma_addr_o = in_addr;
-  assign pma_size_o = 3'(in_lg);
+  // The access being checked.  Combinational, and the answers are expected in
+  // the same cycle: SPEC 11 requires both checks to run in parallel with the
+  // D$ tag lookup, because the result decides whether the access may proceed
+  // at all.  `ex` is not in the query because MEM never fetches.
+  assign chk_addr_o = in_addr;
+  assign chk_size_o = 3'(in_lg);
+  assign chk_rd_o   = rd_acc;
+  assign chk_wr_o   = wr_acc;
+  assign chk_priv_o = priv_i;
 
-  // PMP lives in its own module: the fetch path needs the same check on the
-  // instruction address, and a check that can be unit-tested on its own is
-  // worth more than one buried in a pipeline stage.
   logic pmp_ok;
-
-  s1_pmp #(.REGIONS(PMP_REGIONS)) u_pmp (
-    .addr_i    (in_addr),
-    .size_i    (3'(in_lg)),
-    .rd_i      (rd_acc),
-    .wr_i      (wr_acc),
-    .ex_i      (1'b0),          // MEM never fetches
-    .priv_i    (priv_i),
-    .pmpcfg_i  (pmpcfg_i),
-    .pmpaddr_i (pmpaddr_i),
-    .allow_o   (pmp_ok)
-  );
+  assign pmp_ok = pmp_allow_i;
 
   logic in_mem, misalign, atomic_bad, in_fault, in_ok_read, in_ok_write;
   logic [5:0] fault_code;
@@ -201,7 +197,7 @@ module s1_mem_stage
   logic [STORE_BUF_N-1:0][WIN_BYTES-1:0] sb_mask_q;
   logic [STORE_BUF_N-1:0][WIN_W-1:0]     sb_data_q;
   logic [STORE_BUF_N-1:0][1:0]           sb_mode_q;
-  logic [STORE_BUF_N-1:0][CB_IDX_W-1:0]  sb_idx_q;
+  logic [STORE_BUF_N-1:0][TAG_W-1:0]  sb_idx_q;
   logic [STORE_BUF_N-1:0]                sb_commit_q;
   logic [CNT_W-1:0]                      sb_cnt_q;
   logic                                  dr_lo_sent_q, dr_hi_sent_q;
@@ -249,7 +245,7 @@ module s1_mem_stage
   // P2: a strongly-ordered read follows every older store onto the bus.
   // P1: a non-idempotent read is never speculative, so it waits for the head.
   assign order_wait = in_ok_read && (!pma_i.idempotent || pma_i.strong_order) && (sb_cnt_q != '0);
-  assign head_wait  = in_ok_read && !pma_i.idempotent && (mem_i.cb_idx != cb_head_idx_i);
+  assign head_wait  = in_ok_read && !pma_i.idempotent && (mem_i.tag != oldest_tag_i);
 
   // ---------------------------------------------------------------------------
   // MEM/WB register
@@ -309,9 +305,9 @@ module s1_mem_stage
   assign port_free = !hold_q && (!outst_q || dmem_rsp_valid_i);
   assign a_want    = mw_valid_q && mw_bus_q && mw_need_hi_q && !mw_hi_sent_q && !flush_i
                      && (mw_lo_got_q || (lo_rsp_now && !dmem_rsp_i.err));
-  assign c_want    = (sb_cnt_q != '0) && sb_commit_q[0] && !mxif_mem_busy_i
+  assign c_want    = (sb_cnt_q != '0) && sb_commit_q[0]
                      && (!dr_lo_sent_q || (dr_need_hi && !dr_hi_sent_q));
-  assign b_want    = in_ok_read && bus_need && !order_wait && !head_wait && !mxif_mem_busy_i
+  assign b_want    = in_ok_read && bus_need && !order_wait && !head_wait
                      && (!is_amox || sb_space) && mw_free && !flush_i;
   assign a_go      = port_free && a_want;
   assign c_go      = port_free && !a_want && c_want;
@@ -372,8 +368,7 @@ module s1_mem_stage
   always_comb begin
     mem_ready_o = !flush_i && mw_free;
     if (in_mem && !in_fault) begin
-      if (mxif_mem_busy_i)  mem_ready_o = 1'b0;
-      else if (!rd_acc)     mem_ready_o = mem_ready_o && sb_space;
+      if (!rd_acc)     mem_ready_o = mem_ready_o && sb_space;
       else if (bus_need)    mem_ready_o = b_go;
       else                  mem_ready_o = mem_ready_o && !order_wait && !head_wait
                                           && (!is_amox || sb_space);
@@ -406,12 +401,18 @@ module s1_mem_stage
       mw_amo_op_q   <= AMO_NONE;
     end else if (accept) begin
       mw_valid_q          <= 1'b1;
-      mw_q.cb_idx         <= mem_i.cb_idx;
-      mw_q.complete       <= mem_i.complete;
+      mw_q.tag         <= mem_i.tag;
       mw_q.rd             <= mem_i.rd;
       mw_q.rd_we          <= mem_i.rd_we;
       mw_q.result         <= is_sc ? XLEN'(sc_skip || in_fault) : mem_i.result;
       mw_q.next_pc        <= mem_i.next_pc;
+      mw_q.pc             <= mem_i.pc;
+      mw_q.instr          <= mem_i.instr;
+      mw_q.sys_op         <= mem_i.sys_op;
+      mw_q.rs1_addr       <= mem_i.rs1_addr;
+      mw_q.rs2_addr       <= mem_i.rs2_addr;
+      mw_q.rs1_rdata      <= mem_i.rs1_rdata;
+      mw_q.rs2_rdata      <= mem_i.rs2_rdata;
       mw_q.csr_we         <= mem_i.csr_we;
       mw_q.csr_addr       <= mem_i.csr_addr;
       mw_q.csr_wdata      <= mem_i.csr_wdata;
@@ -502,6 +503,12 @@ module s1_mem_stage
       end
     end
   end
+  // An instruction in MEM/WB that is not completing this cycle.  It is past
+  // EX/MEM, so ID cannot see it there, yet its result does not exist: ID must
+  // stall a consumer of its rd, and treat the pipeline as busy for
+  // serialisation.  Only a read waiting on the bus can be in this state.
+  assign wb_pend_o = mw_valid_q && !mw_done;
+
   assign amo_alloc = wb_valid_o && mw_amox_q && !wb_o.exc;
   assign lr_set    = wb_valid_o && mw_lr_q   && !wb_o.exc;
 
@@ -530,7 +537,7 @@ module s1_mem_stage
   logic [WIN_BYTES-1:0] al_mask;
   logic [WIN_W-1:0]     al_data;
   logic [1:0]           al_mode;
-  logic [CB_IDX_W-1:0]  al_idx;
+  logic [TAG_W-1:0]  al_idx;
 
   always_comb begin
     alloc   = accept && in_ok_write;
@@ -540,7 +547,7 @@ module s1_mem_stage
     al_mask = in_mask;
     al_data = in_wdata;
     al_mode = priv_i;
-    al_idx  = mem_i.cb_idx;
+    al_idx  = mem_i.tag;
     if (amo_alloc) begin
       alloc   = 1'b1;
       al_beat = mw_q.mem_addr[XLEN-1:OFF_W];
@@ -549,7 +556,7 @@ module s1_mem_stage
       al_mask = mw_mask_q;
       al_data = WIN_W'(new_val) << (32'(mw_q.mem_addr[OFF_W-1:0]) * BYTE_W);
       al_mode = mw_mode_q;
-      al_idx  = mw_q.cb_idx;
+      al_idx  = mw_q.tag;
     end
   end
 
@@ -559,7 +566,7 @@ module s1_mem_stage
   logic [STORE_BUF_N-1:0][WIN_BYTES-1:0] sb_mask_d;
   logic [STORE_BUF_N-1:0][WIN_W-1:0]     sb_data_d;
   logic [STORE_BUF_N-1:0][1:0]           sb_mode_d;
-  logic [STORE_BUF_N-1:0][CB_IDX_W-1:0]  sb_idx_d;
+  logic [STORE_BUF_N-1:0][TAG_W-1:0]  sb_idx_d;
   logic [STORE_BUF_N-1:0]                sb_commit_d;
   logic [CNT_W-1:0]                      sb_cnt_d, kept;
 
@@ -576,7 +583,7 @@ module s1_mem_stage
     sb_cnt_d    = sb_cnt_q;
 
     for (int unsigned i = 0; i < STORE_BUF_N; i++) begin
-      if (sb_commit_i && i < 32'(sb_cnt_q) && !sb_commit_q[i] && sb_idx_q[i] == sb_commit_idx_i) begin
+      if (sb_commit_i && i < 32'(sb_cnt_q) && !sb_commit_q[i] && sb_idx_q[i] == sb_commit_tag_i) begin
         sb_commit_d[i] = 1'b1;
       end
     end
@@ -664,7 +671,8 @@ module s1_mem_stage
                                        : {sb_beat_q[0], sb_off_q[0]};
 
   // id: one outstanding request.  errcode: encoding undefined in I2.  aq/rl
-  // are encoding bits with no MEM behaviour.  X, and pmpcfg[6:5], are not data.
+  // need no action: one access in flight and a FIFO store buffer already
+  // order every access as they ask.  cacheable: no D$ here to bypass.
   logic unused_inputs;
   always_comb begin
     unused_inputs = ^{dmem_rsp_i.id, dmem_rsp_i.errcode, mem_i.aq, mem_i.rl, pma_i.cacheable};
